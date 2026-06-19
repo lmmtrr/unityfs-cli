@@ -1,0 +1,82 @@
+name: "CLI Release"
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+jobs:
+  build-release:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "ubuntu-latest"
+            target: "x86_64-unknown-linux-gnu"
+            output_name: "unityfs-cli"
+            archive_name: "unityfs-cli-linux-x86_64.tar.gz"
+          - platform: "macos-latest"
+            target: "aarch64-apple-darwin"
+            output_name: "unityfs-cli"
+            archive_name: "unityfs-cli-macos-arm64.tar.gz"
+          - platform: "windows-latest"
+            target: "x86_64-pc-windows-msvc"
+            output_name: "unityfs-cli.exe"
+            archive_name: "unityfs-cli-windows-x86_64.zip"
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        with:
+          egress-policy: audit
+
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1.0.86
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: install python requests
+        run: pip install requests
+
+      - name: audit Rust dependencies
+        uses: actions-rust-lang/audit@72c09e02f132669d52284a3323acdb503cfc1a24 # v1.2.7
+        env:
+          PYTHONUTF8: 1
+
+      - name: Build CLI binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare Archive (Unix)
+        if: matrix.platform != 'windows-latest'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf ../../../${{ matrix.archive_name }} ${{ matrix.output_name }}
+
+      - name: Prepare Archive (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.output_name }} -DestinationPath ${{ matrix.archive_name }}
+
+      - name: Upload Binary to Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          # Create release if it does not exist yet
+          gh release view "$TAG_NAME" >/dev/null 2>&1 || gh release create "$TAG_NAME" --generate-notes
+          # Upload release asset
+          gh release upload "$TAG_NAME" ${{ matrix.archive_name }} --clobber
