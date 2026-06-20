@@ -1218,9 +1218,9 @@ checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
 
 [[package]]
 name = "unityfs"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e57df753e18578e4d2e15482996c0827ebd92712ea58c96952539203c773157d"
+checksum = "5ab3b64e9efb46cd07d1079287a558db3b7fc52e2b6f12c81f302ded60dc1666"
 dependencies = [
  "crc32fast",
  "half",

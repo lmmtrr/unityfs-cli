@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-unityfs = "0.1.0"
+unityfs = "0.1.1"
 clap = { version = "4.6", features = ["derive"] }
 image = "0.25"
 texture2ddecoder = "0.1"

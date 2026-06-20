@@ -166,6 +166,105 @@ fn is_unity_bundle(path: &Path) -> bool {
     }
     false
 }
+fn find_and_extract_criware_bytes(
+    value: &UnityValue,
+    output_dir: &Path,
+    base_name: &str,
+    parent_key: &str,
+    pb: &indicatif::ProgressBar,
+) -> bool {
+    match value {
+        UnityValue::Bytes(bytes) => {
+            if bytes.len() > 16 {
+                let header = &bytes[..std::cmp::min(16, bytes.len())];
+                let mut ext = None;
+                if header.starts_with(b"@UTF") {
+                    ext = Some("acb");
+                } else if header.starts_with(b"AFS2") || header.starts_with(b"AWBP") {
+                    ext = Some("awb");
+                } else if header.starts_with(b"CPK ") {
+                    ext = Some("cpk");
+                } else if header.starts_with(b"RIFF") {
+                    ext = Some("wav");
+                } else if header.starts_with(b"OggS") {
+                    ext = Some("ogg");
+                } else if header.len() >= 8 && &header[4..8] == b"ftyp" {
+                    ext = Some("m4a");
+                }
+                if let Some(extension) = ext {
+                    let filename = if parent_key.is_empty() {
+                        format!("{}.{}", base_name, extension)
+                    } else {
+                        format!("{}_{}.{}", base_name, parent_key, extension)
+                    };
+                    let cri_dir = output_dir.join("CriWare");
+                    let _ = std::fs::create_dir_all(&cri_dir);
+                    let dest = cri_dir.join(filename);
+                    if let Err(e) = std::fs::write(&dest, bytes) {
+                        pb.println(format!("    Failed to write CriWare asset '{}': {}", dest.display(), e));
+                        return false;
+                    } else {
+                        pb.println(format!("    Extracted CriWare {} file: {}", extension.to_uppercase(), dest.display()));
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        UnityValue::Array(arr) => {
+            if !arr.is_empty() && arr.len() > 16 {
+                let mut bytes = Vec::with_capacity(arr.len());
+                let mut is_byte_array = true;
+                for item in arr {
+                    match item {
+                        UnityValue::UInt8(b) => bytes.push(*b),
+                        UnityValue::Int8(b) => bytes.push(*b as u8),
+                        UnityValue::UInt16(b) => bytes.push(*b as u8),
+                        UnityValue::Int16(b) => bytes.push(*b as u8),
+                        UnityValue::UInt32(b) => bytes.push(*b as u8),
+                        UnityValue::Int32(b) => bytes.push(*b as u8),
+                        UnityValue::UInt64(b) => bytes.push(*b as u8),
+                        UnityValue::Int64(b) => bytes.push(*b as u8),
+                        _ => {
+                            is_byte_array = false;
+                            break;
+                        }
+                    }
+                }
+                if is_byte_array {
+                    return find_and_extract_criware_bytes(&UnityValue::Bytes(bytes), output_dir, base_name, parent_key, pb);
+                }
+            }
+            let mut extracted = false;
+            for (idx, item) in arr.iter().enumerate() {
+                let item_key = if parent_key.is_empty() {
+                    idx.to_string()
+                } else {
+                    format!("{}_{}", parent_key, idx)
+                };
+                if find_and_extract_criware_bytes(item, output_dir, base_name, &item_key, pb) {
+                    extracted = true;
+                }
+            }
+            extracted
+        }
+        UnityValue::Map(map) => {
+            let mut extracted = false;
+            for (k, v) in map {
+                let item_key = if parent_key.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{}_{}", parent_key, k)
+                };
+                if find_and_extract_criware_bytes(v, output_dir, base_name, &item_key, pb) {
+                    extracted = true;
+                }
+            }
+            extracted
+        }
+        _ => false,
+    }
+}
 fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &ExtractFilter, pb: &indicatif::ProgressBar) {
     let file_stem = file_path
         .file_stem()
@@ -220,8 +319,8 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
         .filter(|(asset_name, obj)| {
             let class_id = obj.class_id;
             let is_supported = match class_id {
-                28 | 49 | 43 | 83 | 48 | 329 => true,
-                1 | 4 | 21 | 74 | 114 | 115 if filter.extract_metadata => true,
+                28 | 49 | 43 | 83 | 48 | 329 | 114 => true,
+                1 | 4 | 21 | 74 | 115 if filter.extract_metadata => true,
                 _ => false,
             };
             if !is_supported {
@@ -289,7 +388,19 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
                     329 => {
                         extract_videoclip(&unity_value, &bundle_output_dir, &asset_manager, pb)
                     }
-                    1 | 4 | 21 | 74 | 114 | 115 => {
+                    114 => {
+                        let base_name = if !m_name.is_empty() {
+                            m_name.clone()
+                        } else {
+                            format!("monobehaviour_{}", path_id)
+                        };
+                        let ext_success = find_and_extract_criware_bytes(&unity_value, &bundle_output_dir, &base_name, "", pb);
+                        if filter.extract_metadata {
+                            dump_asset_as_json(class_id, t_name, &unity_value, &bundle_output_dir, path_id);
+                        }
+                        ext_success
+                    }
+                    1 | 4 | 21 | 74 | 115 => {
                         if filter.extract_metadata {
                             dump_asset_as_json(class_id, t_name, &unity_value, &bundle_output_dir, path_id)
                         } else {
