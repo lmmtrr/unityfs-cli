@@ -109,6 +109,27 @@ fn clean_drag_drop_path(input: &str) -> String {
     }
     cleaned.trim().to_string()
 }
+fn get_unique_path(dir: &Path, filename: &str) -> PathBuf {
+    let base_path = dir.join(filename);
+    if !base_path.exists() {
+        return base_path;
+    }
+    let stem = base_path.file_stem().unwrap_or_default().to_string_lossy();
+    let extension = base_path.extension().unwrap_or_default().to_string_lossy();
+    let mut counter = 2;
+    loop {
+        let new_filename = if extension.is_empty() {
+            format!("{} ({})", stem, counter)
+        } else {
+            format!("{} ({}).{}", stem, counter, extension)
+        };
+        let new_path = dir.join(new_filename);
+        if !new_path.exists() {
+            return new_path;
+        }
+        counter += 1;
+    }
+}
 fn run_interactive_mode(output_dir: &Path, filter: &ExtractFilter) {
     println!("=========================================");
     println!("  Asset Tool CLI - Drag & Drop Extractor ");
@@ -199,7 +220,7 @@ fn find_and_extract_criware_bytes(
                     };
                     let cri_dir = output_dir.join("CriWare");
                     let _ = std::fs::create_dir_all(&cri_dir);
-                    let dest = cri_dir.join(filename);
+                    let dest = get_unique_path(&cri_dir, &filename);
                     if let Err(e) = std::fs::write(&dest, bytes) {
                         pb.println(format!("    Failed to write CriWare asset '{}': {}", dest.display(), e));
                         return false;
@@ -293,7 +314,7 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
             return;
         }
     };
-    let bundle_output_dir = base_output_dir.join(format!("{}_extracted", file_stem));
+    let bundle_output_dir = base_output_dir.to_path_buf();
     if let Err(e) = std::fs::create_dir_all(&bundle_output_dir) {
         pb.println(format!("[{}] Failed to create output directory '{}': {}", file_stem, bundle_output_dir.display(), e));
         return;
@@ -448,7 +469,7 @@ fn extract_text_asset(val: &UnityValue, output_dir: &Path, pb: &indicatif::Progr
         };
         let text_dir = output_dir.join("TextAsset");
         let _ = std::fs::create_dir_all(&text_dir);
-        let dest = text_dir.join(filename);
+        let dest = get_unique_path(&text_dir, &filename);
         if let Err(e) = std::fs::write(&dest, &data) {
             pb.println(format!("    Failed to write text asset '{}': {}", dest.display(), e));
             false
@@ -536,7 +557,7 @@ fn extract_texture2d(
         };
         let texture_dir = output_dir.join("Texture2D");
         let _ = std::fs::create_dir_all(&texture_dir);
-        let dest = texture_dir.join(filename);
+        let dest = get_unique_path(&texture_dir, &filename);
         if let Err(e) = image::save_buffer(
             &dest,
             &rgba_data,
@@ -611,7 +632,7 @@ fn extract_mesh(val: &UnityValue, output_dir: &Path, pb: &indicatif::ProgressBar
         };
         let mesh_dir = output_dir.join("Mesh");
         let _ = std::fs::create_dir_all(&mesh_dir);
-        let dest = mesh_dir.join(filename);
+        let dest = get_unique_path(&mesh_dir, &filename);
         if let Err(e) = std::fs::write(&dest, obj_content) {
             pb.println(format!("    Failed to write Mesh OBJ '{}': {}", dest.display(), e));
             false
@@ -698,7 +719,7 @@ fn extract_audioclip(
     };
     let audio_dir = output_dir.join("AudioClip");
     let _ = std::fs::create_dir_all(&audio_dir);
-    let dest = audio_dir.join(filename);
+    let dest = get_unique_path(&audio_dir, &filename);
     if let Err(e) = std::fs::write(&dest, &audio_data) {
         pb.println(format!("    Failed to write AudioClip '{}': {}", dest.display(), e));
         false
@@ -748,7 +769,7 @@ fn extract_videoclip(
             };
             let video_dir = output_dir.join("VideoClip");
             let _ = std::fs::create_dir_all(&video_dir);
-            let dest = video_dir.join(filename);
+            let dest = get_unique_path(&video_dir, &filename);
             if let Err(e) = std::fs::write(&dest, &video_data) {
                 pb.println(format!("    Failed to write VideoClip '{}': {}", dest.display(), e));
                 false
@@ -782,7 +803,7 @@ fn extract_shader(val: &UnityValue, output_dir: &Path, pb: &indicatif::ProgressB
         };
         let shader_dir = output_dir.join("Shader");
         let _ = std::fs::create_dir_all(&shader_dir);
-        let dest = shader_dir.join(filename);
+        let dest = get_unique_path(&shader_dir, &filename);
         if let Err(e) = std::fs::write(&dest, &data) {
             pb.println(format!("    Failed to write Shader '{}': {}", dest.display(), e));
             false
@@ -821,7 +842,7 @@ fn dump_asset_as_json(
     };
     let target_dir = output_dir.join(sub_dir_name);
     let _ = std::fs::create_dir_all(&target_dir);
-    let dest = target_dir.join(filename);
+    let dest = get_unique_path(&target_dir, &filename);
     if let Ok(json_str) = serde_json::to_string_pretty(&json_val) {
         std::fs::write(&dest, json_str).is_ok()
     } else {
