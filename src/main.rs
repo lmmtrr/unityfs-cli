@@ -18,12 +18,14 @@ struct Args {
     output: String,
     #[arg(short, long)]
     metadata: bool,
-    #[arg(long = "name", short = "n")]
+    #[arg(long = "name", short = 'n')]
     filter_name: Option<String>,
-    #[arg(long = "type", short = "t")]
+    #[arg(long = "type", short = 't')]
     filter_type: Option<String>,
-    #[arg(long = "by-file", short = "b", help = "Extract into subdirectories named after each bundle file, without asset class subfolders")]
+    #[arg(long = "by-file", short = 'b', help = "Extract into subdirectories named after each bundle file, without asset class subfolders")]
     by_file: bool,
+    #[arg(long = "live2d", short = 'l', help = "Reconstruct and merge Live2D models from extracted assets")]
+    live2d: bool,
 }
 #[derive(Clone, Debug)]
 struct ExtractFilter {
@@ -31,6 +33,7 @@ struct ExtractFilter {
     filter_name: Option<String>,
     filter_type: Option<String>,
     by_file: bool,
+    live2d: bool,
 }
 fn extract_bundle_files_in_parallel(files: &[PathBuf], base_output_dir: &Path, filter: &ExtractFilter) {
     let pb = indicatif::ProgressBar::new(files.len() as u64);
@@ -79,6 +82,7 @@ fn main() {
         filter_name: args.filter_name,
         filter_type: args.filter_type,
         by_file: args.by_file,
+        live2d: args.live2d,
     };
     if input_paths.is_empty() {
         run_interactive_mode(&output_dir, &filter);
@@ -100,6 +104,9 @@ fn main() {
             println!("No Unity asset bundles found to extract.");
         } else {
             extract_bundle_files_in_parallel(&files_to_extract, &output_dir, &filter);
+            if filter.live2d {
+                reconstruct_live2d_models(&output_dir);
+            }
         }
     }
 }
@@ -114,10 +121,22 @@ fn clean_drag_drop_path(input: &str) -> String {
     }
     cleaned.trim().to_string()
 }
-fn get_unique_path(dir: &Path, filename: &str) -> PathBuf {
+#[derive(Debug)]
+enum UniquePathResult {
+    New(PathBuf),
+    Exists(PathBuf),
+}
+fn get_unique_path(dir: &Path, filename: &str, data: Option<&[u8]>) -> UniquePathResult {
     let base_path = dir.join(filename);
     if !base_path.exists() {
-        return base_path;
+        return UniquePathResult::New(base_path);
+    }
+    if let Some(bytes) = data {
+        if let Ok(metadata) = std::fs::metadata(&base_path) {
+            if metadata.len() == bytes.len() as u64 {
+                return UniquePathResult::Exists(base_path);
+            }
+        }
     }
     let stem = base_path.file_stem().unwrap_or_default().to_string_lossy();
     let extension = base_path.extension().unwrap_or_default().to_string_lossy();
@@ -130,7 +149,14 @@ fn get_unique_path(dir: &Path, filename: &str) -> PathBuf {
         };
         let new_path = dir.join(new_filename);
         if !new_path.exists() {
-            return new_path;
+            return UniquePathResult::New(new_path);
+        }
+        if let Some(bytes) = data {
+            if let Ok(metadata) = std::fs::metadata(&new_path) {
+                if metadata.len() == bytes.len() as u64 {
+                    return UniquePathResult::Exists(new_path);
+                }
+            }
         }
         counter += 1;
     }
@@ -162,6 +188,9 @@ fn run_interactive_mode(output_dir: &Path, filter: &ExtractFilter) {
             continue;
         }
         extract_path(path, output_dir, filter);
+        if filter.live2d {
+            reconstruct_live2d_models(output_dir);
+        }
         println!("\nReady for next input. Drag & drop another file/folder, or 'q' to quit.");
     }
 }
@@ -230,14 +259,17 @@ fn find_and_extract_criware_bytes(
                         output_dir.join("CriWare")
                     };
                     let _ = std::fs::create_dir_all(&cri_dir);
-                    let dest = get_unique_path(&cri_dir, &filename);
-                    if let Err(e) = std::fs::write(&dest, bytes) {
-                        pb.println(format!("    Failed to write CriWare asset '{}': {}", dest.display(), e));
-                        return false;
-                    } else {
-                        pb.println(format!("    Extracted CriWare {} file: {}", extension.to_uppercase(), dest.display()));
-                        return true;
-                    }
+                    return match get_unique_path(&cri_dir, &filename, Some(bytes)) {
+                        UniquePathResult::New(dest) => {
+                            if let Err(e) = std::fs::write(&dest, bytes) {
+                                pb.println(format!("    Failed to write CriWare asset '{}': {}", dest.display(), e));
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                        UniquePathResult::Exists(_) => true,
+                    };
                 }
             }
             false
@@ -296,12 +328,527 @@ fn find_and_extract_criware_bytes(
         _ => false,
     }
 }
+struct PosePartData {
+    id: String,
+    group_index: i32,
+    link: Vec<String>,
+}
+fn get_mono_behaviour_class_name(
+    asset_manager: &AssetManager,
+    asset_name: &str,
+    m_script_pptr: &UnityValue,
+) -> Option<String> {
+    if let UnityValue::PPtr { file_id, path_id } = m_script_pptr {
+        if let Ok(script_val) = asset_manager.read_object_value(asset_name, *file_id, *path_id) {
+            if let Some(UnityValue::String(class_name)) = script_val.get("m_ClassName") {
+                return Some(class_name.clone());
+            }
+        }
+    }
+    None
+}
+fn resolve_class_name(
+    value: &UnityValue,
+    asset_manager: &AssetManager,
+    asset_name: &str,
+) -> Option<String> {
+    if let Some(script_pptr) = value.get("m_Script") {
+        if let Some(class_name) = get_mono_behaviour_class_name(asset_manager, asset_name, script_pptr) {
+            return Some(class_name);
+        }
+    }
+    if value.get("ParameterIds").is_some() && value.get("ParameterCurves").is_some() {
+        return Some("CubismFadeMotionData".to_string());
+    }
+    if value.get("Parameters").is_some() && value.get("FadeInTime").is_some() && value.get("FadeOutTime").is_some() {
+        if value.get("ParameterIds").is_none() {
+            return Some("CubismExpressionData".to_string());
+        }
+    }
+    if value.get("GroupIndex").is_some() && value.get("Link").is_some() && value.get("m_GameObject").is_some() {
+        return Some("CubismPosePart".to_string());
+    }
+    None
+}
+struct Keyframe {
+    time: f32,
+    value: f32,
+    in_slope: f32,
+    out_slope: f32,
+}
+fn parse_float(val: Option<&UnityValue>) -> Option<f32> {
+    match val {
+        Some(UnityValue::Float(f)) => Some(*f),
+        Some(UnityValue::Double(d)) => Some(*d as f32),
+        Some(UnityValue::Int8(i)) => Some(*i as f32),
+        Some(UnityValue::UInt8(u)) => Some(*u as f32),
+        Some(UnityValue::Int16(i)) => Some(*i as f32),
+        Some(UnityValue::UInt16(u)) => Some(*u as f32),
+        Some(UnityValue::Int32(i)) => Some(*i as f32),
+        Some(UnityValue::UInt32(u)) => Some(*u as f32),
+        Some(UnityValue::Int64(i)) => Some(*i as f32),
+        Some(UnityValue::UInt64(u)) => Some(*u as f32),
+        _ => None,
+    }
+}
+fn parse_keyframe(val: &UnityValue) -> Option<Keyframe> {
+    let map = match val {
+        UnityValue::Map(m) => m,
+        _ => return None,
+    };
+    let time = parse_float(map.get("time"))?;
+    let value = parse_float(map.get("value"))?;
+    let in_slope = parse_float(map.get("inSlope"))
+        .or_else(|| parse_float(map.get("in_slope")))
+        .unwrap_or(0.0);
+    let out_slope = parse_float(map.get("outSlope"))
+        .or_else(|| parse_float(map.get("out_slope")))
+        .unwrap_or(0.0);
+    Some(Keyframe { time, value, in_slope, out_slope })
+}
+fn add_segments(
+    curve: &Keyframe,
+    pre_curve: &Keyframe,
+    next_curve: Option<&Keyframe>,
+    segments: &mut Vec<f32>,
+    _force_bezier: bool,
+    total_point_count: &mut i32,
+    total_segment_count: &mut i32,
+    j: &mut usize,
+) {
+    if (curve.time - pre_curve.time - 0.01).abs() < 0.0001 {
+        if let Some(next) = next_curve {
+            if next.value == curve.value {
+                segments.push(3.0);
+                segments.push(next.time);
+                segments.push(next.value);
+                *j += 1;
+                *total_point_count += 1;
+                *total_segment_count += 1;
+                return;
+            }
+        }
+    }
+    if curve.in_slope.is_infinite() && curve.in_slope.is_sign_positive() || curve.in_slope > 1000000.0 {
+        segments.push(2.0);
+        segments.push(curve.time);
+        segments.push(curve.value);
+        *total_point_count += 1;
+    } else if pre_curve.out_slope == 0.0 && curve.in_slope.abs() < 0.0001 {
+        segments.push(0.0);
+        segments.push(curve.time);
+        segments.push(curve.value);
+        *total_point_count += 1;
+    } else {
+        let tangent_length = (curve.time - pre_curve.time) / 3.0;
+        segments.push(1.0);
+        segments.push(pre_curve.time + tangent_length);
+        segments.push(pre_curve.out_slope * tangent_length + pre_curve.value);
+        segments.push(curve.time - tangent_length);
+        segments.push(curve.value - curve.in_slope * tangent_length);
+        segments.push(curve.time);
+        segments.push(curve.value);
+        *total_point_count += 3;
+    }
+    *total_segment_count += 1;
+}
+fn convert_fade_motion_to_json(value: &UnityValue) -> Option<serde_json::Value> {
+    let map = match value {
+        UnityValue::Map(m) => m,
+        _ => return None,
+    };
+    let motion_length = parse_float(map.get("MotionLength")).unwrap_or(0.0);
+    let fade_in_time = parse_float(map.get("FadeInTime")).unwrap_or(0.0);
+    let fade_out_time = parse_float(map.get("FadeOutTime")).unwrap_or(0.0);
+    let parameter_ids = match map.get("ParameterIds") {
+        Some(UnityValue::Array(arr)) => {
+            arr.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect::<Vec<_>>()
+        }
+        _ => Vec::new(),
+    };
+    let parameter_fade_in_times = match map.get("ParameterFadeInTimes") {
+        Some(UnityValue::Array(arr)) => {
+            arr.iter().map(|v| parse_float(Some(v)).unwrap_or(-1.0)).collect::<Vec<_>>()
+        }
+        _ => Vec::new(),
+    };
+    let parameter_fade_out_times = match map.get("ParameterFadeOutTimes") {
+        Some(UnityValue::Array(arr)) => {
+            arr.iter().map(|v| parse_float(Some(v)).unwrap_or(-1.0)).collect::<Vec<_>>()
+        }
+        _ => Vec::new(),
+    };
+    let parameter_curves = match map.get("ParameterCurves") {
+        Some(UnityValue::Array(arr)) => arr,
+        _ => return None,
+    };
+    let mut curves_json = Vec::new();
+    let mut total_segment_count = 0;
+    let mut total_point_count = 0;
+    for i in 0..parameter_curves.len() {
+        let curve_val = &parameter_curves[i];
+        let curve_map = match curve_val {
+            UnityValue::Map(m) => m,
+            _ => continue,
+        };
+        let m_curve = match curve_map.get("m_Curve") {
+            Some(UnityValue::Array(arr)) => arr,
+            _ => continue,
+        };
+        if m_curve.is_empty() {
+            continue;
+        }
+        let keyframes: Vec<Keyframe> = m_curve.iter().filter_map(parse_keyframe).collect();
+        if keyframes.is_empty() {
+            continue;
+        }
+        let param_id = parameter_ids.get(i).cloned().unwrap_or_else(|| "".to_string());
+        if param_id.is_empty() {
+            continue;
+        }
+        let target = match param_id.as_str() {
+            "Opacity" | "EyeBlink" | "LipSync" => "Model",
+            _ => {
+                if param_id.to_lowercase().contains("part") {
+                    "PartOpacity"
+                } else {
+                    "Parameter"
+                }
+            }
+        };
+        let curve_fade_in = parameter_fade_in_times.get(i).cloned().unwrap_or(-1.0);
+        let curve_fade_out = parameter_fade_out_times.get(i).cloned().unwrap_or(-1.0);
+        let mut segments = vec![keyframes[0].time, keyframes[0].value];
+        let mut j = 1;
+        while j < keyframes.len() {
+            let curve = &keyframes[j];
+            let pre_curve = &keyframes[j - 1];
+            let next_curve = keyframes.get(j + 1);
+            add_segments(
+                curve,
+                pre_curve,
+                next_curve,
+                &mut segments,
+                false,
+                &mut total_point_count,
+                &mut total_segment_count,
+                &mut j,
+            );
+            j += 1;
+        }
+        total_point_count += 1;
+        curves_json.push(serde_json::json!({
+            "Target": target,
+            "Id": param_id,
+            "FadeInTime": curve_fade_in,
+            "FadeOutTime": curve_fade_out,
+            "Segments": segments,
+        }));
+    }
+    let curve_count = curves_json.len();
+    let motion_json = serde_json::json!({
+        "Version": 3,
+        "Meta": {
+            "Duration": motion_length,
+            "Fps": 30.0,
+            "Loop": true,
+            "AreBeziersRestricted": true,
+            "FadeInTime": fade_in_time,
+            "FadeOutTime": fade_out_time,
+            "CurveCount": curve_count as i32,
+            "TotalSegmentCount": total_segment_count,
+            "TotalPointCount": total_point_count,
+            "UserDataCount": 0,
+            "TotalUserDataSize": 0
+        },
+        "Curves": curves_json,
+        "UserData": []
+    });
+    Some(motion_json)
+}
+fn convert_expression_data_to_json(value: &UnityValue) -> Option<serde_json::Value> {
+    let map = match value {
+        UnityValue::Map(m) => m,
+        _ => return None,
+    };
+    let exp_type = match map.get("Type") {
+        Some(UnityValue::String(s)) => s.clone(),
+        _ => "Live2D Expression".to_string(),
+    };
+    let fade_in_time = parse_float(map.get("FadeInTime")).unwrap_or(1.0);
+    let fade_out_time = parse_float(map.get("FadeOutTime")).unwrap_or(1.0);
+    let parameters = match map.get("Parameters") {
+        Some(UnityValue::Array(arr)) => {
+            let mut params_json = Vec::new();
+            for item in arr {
+                if let UnityValue::Map(item_map) = item {
+                    let id = match item_map.get("Id") {
+                        Some(UnityValue::String(s)) => s.clone(),
+                        _ => continue,
+                    };
+                    let val = parse_float(item_map.get("Value")).unwrap_or(0.0);
+                    let blend = match item_map.get("Blend") {
+                        Some(v) => v.as_i32().unwrap_or(0),
+                        _ => 0,
+                    };
+                    params_json.push(serde_json::json!({
+                        "Id": id,
+                        "Value": val,
+                        "Blend": blend
+                    }));
+                }
+            }
+            params_json
+        }
+        _ => Vec::new(),
+    };
+    Some(serde_json::json!({
+        "Type": exp_type,
+        "FadeInTime": fade_in_time,
+        "FadeOutTime": fade_out_time,
+        "Parameters": parameters
+    }))
+}
+fn flatten_json_paths(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            if s.contains('/') || s.contains('\\') {
+                if let Some(filename) = Path::new(s).file_name() {
+                    *s = filename.to_string_lossy().into_owned();
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                flatten_json_paths(v);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                flatten_json_paths(v);
+            }
+        }
+        _ => {}
+    }
+}
+fn extract_monobehaviour(
+    val: &UnityValue,
+    output_dir: &Path,
+    asset_manager: &AssetManager,
+    asset_name: &str,
+    obj: &unityfs::objectreader::ObjectReader,
+    by_file: bool,
+    pb: &indicatif::ProgressBar,
+    pose_parts: &std::sync::Mutex<Vec<PosePartData>>,
+    moc_stem: &std::sync::Mutex<Option<String>>,
+) -> bool {
+    let name = match val.get("m_Name") {
+        Some(UnityValue::String(s)) if !s.is_empty() => s.clone(),
+        _ => "".to_string(),
+    };
+    let base_name = if !name.is_empty() {
+        Path::new(&name)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or(name)
+    } else {
+        format!("monobehaviour_{}", obj.path_id)
+    };
+    let sanitized_base = base_name.replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.', "");
+    if sanitized_base.is_empty() {
+        return false;
+    }
+    if find_and_extract_criware_bytes(val, output_dir, &sanitized_base, "", by_file, pb) {
+        return true;
+    }
+    let mut is_cubism_pose_part = false;
+    if let Some(class_name) = resolve_class_name(val, asset_manager, asset_name) {
+        if class_name == "CubismPosePart" {
+            is_cubism_pose_part = true;
+        }
+    }
+    if is_cubism_pose_part {
+        let group_index = val.get("GroupIndex").and_then(|v| v.as_i32()).unwrap_or(0);
+        let link = val.get("Link").and_then(|v| match v {
+            UnityValue::Array(arr) => Some(arr.iter().map(|item| item.as_str().unwrap_or("").to_string()).collect::<Vec<_>>()),
+            _ => None
+        }).unwrap_or_default();
+        let mut go_name = String::new();
+        if let Some(go_pptr) = val.get("m_GameObject") {
+            if let UnityValue::PPtr { file_id, path_id } = go_pptr {
+                if let Ok(go_val) = asset_manager.read_object_value(asset_name, *file_id, *path_id) {
+                    if let Some(UnityValue::String(name)) = go_val.get("m_Name") {
+                        go_name = name.clone();
+                    }
+                }
+            }
+        }
+        if !go_name.is_empty() {
+            let mut guard = pose_parts.lock().unwrap();
+            guard.push(PosePartData {
+                id: go_name,
+                group_index,
+                link,
+            });
+        }
+        return true;
+    }
+    let mut content = None;
+    let mut is_cubism_fade_motion = false;
+    let mut is_cubism_expression = false;
+    if let Some(class_name) = resolve_class_name(val, asset_manager, asset_name) {
+        if class_name == "CubismFadeMotionData" {
+            is_cubism_fade_motion = true;
+        } else if class_name == "CubismExpressionData" {
+            is_cubism_expression = true;
+        }
+    }
+    if is_cubism_fade_motion {
+        if let Some(json_val) = convert_fade_motion_to_json(val) {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&json_val) {
+                content = Some(bytes);
+            }
+        }
+    } else if is_cubism_expression {
+        if let Some(json_val) = convert_expression_data_to_json(val) {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&json_val) {
+                content = Some(bytes);
+            }
+        }
+    }
+    if content.is_none() {
+        if let Some(sf) = asset_manager.files.get(asset_name) {
+            let start = obj.byte_start;
+            let size = obj.byte_size;
+            if start + size <= sf.data.len() {
+                let raw_bytes = &sf.data[start .. start + size];
+                if let Some(moc_pos) = raw_bytes.windows(4).position(|window| window == b"MOC3") {
+                    if moc_pos >= 4 {
+                        let size_bytes = &raw_bytes[moc_pos - 4 .. moc_pos];
+                        let is_big_endian = match sf.endian {
+                            unityfs::reader::Endian::Big => true,
+                            unityfs::reader::Endian::Little => false,
+                        };
+                        let moc_size = if is_big_endian {
+                            u32::from_be_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]]) as usize
+                        } else {
+                            u32::from_le_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]]) as usize
+                        };
+                        if moc_pos + moc_size <= raw_bytes.len() {
+                            content = Some(raw_bytes[moc_pos .. moc_pos + moc_size].to_vec());
+                        } else {
+                            content = Some(raw_bytes[moc_pos..].to_vec());
+                        }
+                    } else {
+                        content = Some(raw_bytes[moc_pos..].to_vec());
+                    }
+                }
+            }
+        }
+    }
+    if content.is_none() {
+        for key in &["_bytes", "m_Bytes", "bytes", "m_Data", "_data"] {
+            if let Some(UnityValue::Bytes(b)) = val.get(*key) {
+                content = Some(b.clone());
+                break;
+            }
+        }
+    }
+    if content.is_none() {
+        if let UnityValue::Map(map) = val {
+            for (_, val_item) in map {
+                if let UnityValue::Bytes(b) = val_item {
+                    if b.starts_with(b"MOC3") {
+                        content = Some(b.clone());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(data) = content {
+        let mut final_name = sanitized_base.clone();
+        if is_cubism_expression || final_name.ends_with(".exp") || final_name.ends_with(".exp3") {
+            let name_without_exp = final_name.replace(".exp3", "").replace(".exp", "");
+            final_name = format!("{}.exp3.json", name_without_exp);
+        } else if is_cubism_fade_motion || final_name.ends_with(".fade") || final_name.ends_with(".motion") || final_name.ends_with(".motion3") {
+            let name_without_motion = final_name
+                .replace(".motion3", "")
+                .replace(".motion", "")
+                .replace(".fade", "");
+            final_name = format!("{}.motion3.json", name_without_motion);
+        } else if final_name.ends_with(".model") || final_name.ends_with(".model3") {
+            let name_without = final_name.replace(".model3", "").replace(".model", "");
+            final_name = format!("{}.model3.json", name_without);
+        } else if final_name.ends_with(".physics") || final_name.ends_with(".physics3") {
+            let name_without = final_name.replace(".physics3", "").replace(".physics", "");
+            final_name = format!("{}.physics3.json", name_without);
+        } else if final_name.ends_with(".pose") || final_name.ends_with(".pose3") {
+            let name_without = final_name.replace(".pose3", "").replace(".pose", "");
+            final_name = format!("{}.pose3.json", name_without);
+        } else if final_name.ends_with(".cdi") || final_name.ends_with(".cdi3") {
+            let name_without = final_name.replace(".cdi3", "").replace(".cdi", "");
+            final_name = format!("{}.cdi3.json", name_without);
+        } else if final_name.ends_with(".userdata") || final_name.ends_with(".userdata3") {
+            let name_without = final_name.replace(".userdata3", "").replace(".userdata", "");
+            final_name = format!("{}.userdata3.json", name_without);
+        } else if !final_name.contains('.') {
+            if data.starts_with(b"{") {
+                final_name = format!("{}.json", final_name);
+            } else if data.starts_with(b"MOC3") {
+                final_name = format!("{}.moc3", final_name);
+            } else {
+                let check_len = std::cmp::min(data.len(), 256);
+                let head_str = String::from_utf8_lossy(&data[..check_len]);
+                let has_spine_version = head_str.contains("3.6") || head_str.contains("3.7") ||
+                                        head_str.contains("3.8") || head_str.contains("4.0") ||
+                                        head_str.contains("4.1") || head_str.contains("4.2");
+                if has_spine_version {
+                    final_name = format!("{}.skel", final_name);
+                } else {
+                    final_name = format!("{}.txt", final_name);
+                }
+            }
+        }
+        let monobehaviour_dir = if by_file {
+            output_dir.to_path_buf()
+        } else {
+            output_dir.join("MonoBehaviour")
+        };
+        let _ = std::fs::create_dir_all(&monobehaviour_dir);
+        let mut final_data = data;
+        if final_name.ends_with(".model3.json") {
+            if let Ok(mut json_val) = serde_json::from_slice::<serde_json::Value>(&final_data) {
+                flatten_json_paths(&mut json_val);
+                if let Ok(serialized) = serde_json::to_vec_pretty(&json_val) {
+                    final_data = serialized;
+                }
+            }
+        }
+        if final_name.ends_with(".moc3") {
+            let mut guard = moc_stem.lock().unwrap();
+            *guard = Some(sanitized_base.replace(".moc3", "").replace(".moc", ""));
+        }
+        match get_unique_path(&monobehaviour_dir, &final_name, Some(&final_data)) {
+            UniquePathResult::New(dest) => {
+                if let Err(e) = std::fs::write(&dest, &final_data) {
+                    pb.println(format!("    Failed to write MonoBehaviour asset '{}': {}", dest.display(), e));
+                    false
+                } else {
+                    true
+                }
+            }
+            UniquePathResult::Exists(_) => true,
+        }
+    } else {
+        false
+    }
+}
 fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &ExtractFilter, pb: &indicatif::ProgressBar) {
     let file_stem = file_path
         .file_stem()
         .unwrap_or_else(|| std::ffi::OsStr::new("bundle"))
         .to_string_lossy();
-
     let file = match File::open(file_path) {
         Ok(f) => f,
         Err(e) => {
@@ -324,7 +871,9 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
             return;
         }
     };
-    let bundle_output_dir = if filter.by_file {
+    let bundle_output_dir = if filter.live2d {
+        base_output_dir.join(get_model_base_name(&file_stem))
+    } else if filter.by_file {
         base_output_dir.join(file_stem.as_ref())
     } else {
         base_output_dir.to_path_buf()
@@ -390,6 +939,8 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
     if objects_to_extract.is_empty() {
         return;
     }
+    let pose_parts = std::sync::Mutex::new(Vec::new());
+    let moc_stem = std::sync::Mutex::new(None);
     let _: Vec<String> = objects_to_extract
         .par_iter()
         .filter_map(|(asset_name, obj)| {
@@ -405,38 +956,43 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
                 pb.set_message(format!("{}: {}", t_name, m_name));
                 let success = match class_id {
                     28 => {
-                        extract_texture2d(&unity_value, &bundle_output_dir, &asset_manager, filter.by_file, pb)
+                        extract_texture2d(&unity_value, &bundle_output_dir, &asset_manager, filter.by_file || filter.live2d, pb)
                     }
                     49 => {
-                        extract_text_asset(&unity_value, &bundle_output_dir, filter.by_file, pb)
+                        extract_text_asset(&unity_value, &bundle_output_dir, filter.by_file || filter.live2d, pb)
                     }
                     43 => {
-                        extract_mesh(&unity_value, &bundle_output_dir, filter.by_file, pb)
+                        extract_mesh(&unity_value, &bundle_output_dir, filter.by_file || filter.live2d, pb)
                     }
                     83 => {
-                        extract_audioclip(&unity_value, &bundle_output_dir, &asset_manager, filter.by_file, pb)
+                        extract_audioclip(&unity_value, &bundle_output_dir, &asset_manager, filter.by_file || filter.live2d, pb)
                     }
                     48 => {
-                        extract_shader(&unity_value, &bundle_output_dir, filter.by_file, pb)
+                        extract_shader(&unity_value, &bundle_output_dir, filter.by_file || filter.live2d, pb)
                     }
                     329 => {
-                        extract_videoclip(&unity_value, &bundle_output_dir, &asset_manager, filter.by_file, pb)
+                        extract_videoclip(&unity_value, &bundle_output_dir, &asset_manager, filter.by_file || filter.live2d, pb)
                     }
                     114 => {
-                        let base_name = if !m_name.is_empty() {
-                            m_name.clone()
-                        } else {
-                            format!("monobehaviour_{}", path_id)
-                        };
-                        let ext_success = find_and_extract_criware_bytes(&unity_value, &bundle_output_dir, &base_name, "", filter.by_file, pb);
+                        let success = extract_monobehaviour(
+                            &unity_value,
+                            &bundle_output_dir,
+                            &asset_manager,
+                            asset_name,
+                            obj,
+                            filter.by_file || filter.live2d,
+                            pb,
+                            &pose_parts,
+                            &moc_stem,
+                        );
                         if filter.extract_metadata {
-                            dump_asset_as_json(class_id, t_name, &unity_value, &bundle_output_dir, filter.by_file, path_id);
+                            dump_asset_as_json(class_id, t_name, &unity_value, &bundle_output_dir, filter.by_file || filter.live2d, path_id);
                         }
-                        ext_success
+                        success
                     }
                     1 | 4 | 21 | 74 | 115 => {
                         if filter.extract_metadata {
-                            dump_asset_as_json(class_id, t_name, &unity_value, &bundle_output_dir, filter.by_file, path_id)
+                            dump_asset_as_json(class_id, t_name, &unity_value, &bundle_output_dir, filter.by_file || filter.live2d, path_id)
                         } else {
                             false
                         }
@@ -450,6 +1006,49 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
             res
         })
         .collect();
+    let pose_parts_vec = pose_parts.into_inner().unwrap();
+    if !pose_parts_vec.is_empty() {
+        let stem = moc_stem.into_inner().unwrap().unwrap_or_else(|| {
+            file_stem.to_string()
+        });
+        let monobehaviour_dir = if filter.by_file || filter.live2d {
+            bundle_output_dir.to_path_buf()
+        } else {
+            bundle_output_dir.join("MonoBehaviour")
+        };
+        let mut group_map: std::collections::BTreeMap<i32, Vec<serde_json::Value>> = std::collections::BTreeMap::new();
+        for part in pose_parts_vec {
+            let node = serde_json::json!({
+                "Id": part.id,
+                "Link": part.link,
+            });
+            group_map.entry(part.group_index).or_default().push(node);
+        }
+        let groups: Vec<Vec<serde_json::Value>> = group_map.into_values().collect();
+        let pose_json = serde_json::json!({
+            "Type": "Live2D Pose",
+            "Groups": groups,
+        });
+        if let Ok(serialized) = serde_json::to_vec_pretty(&pose_json) {
+            let _ = std::fs::create_dir_all(&monobehaviour_dir);
+            match get_unique_path(&monobehaviour_dir, &format!("{}.pose3.json", stem), Some(&serialized)) {
+                UniquePathResult::New(dest) => {
+                    if let Err(e) = std::fs::write(&dest, &serialized) {
+                        pb.println(format!("    Failed to write pose asset '{}': {}", dest.display(), e));
+                    }
+                }
+                UniquePathResult::Exists(_) => {}
+            }
+        }
+    }
+}
+fn is_json_bytes(data: &[u8]) -> bool {
+    if let Ok(s) = std::str::from_utf8(data) {
+        let trimmed = s.trim_start();
+        trimmed.starts_with('{') || trimmed.starts_with('[')
+    } else {
+        false
+    }
 }
 fn extract_text_asset(val: &UnityValue, output_dir: &Path, by_file: bool, pb: &indicatif::ProgressBar) -> bool {
     let name = match val.get("m_Name") {
@@ -462,21 +1061,99 @@ fn extract_text_asset(val: &UnityValue, output_dir: &Path, by_file: bool, pb: &i
         _ => None,
     };
     if let Some(data) = content {
-        let safe_name = name.replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.', "");
-        let filename = if safe_name.is_empty() {
-            "text_asset.txt".to_string()
-        } else if safe_name.contains('.') {
-            safe_name
-        } else {
-            let check_len = std::cmp::min(data.len(), 256);
-            let head_str = String::from_utf8_lossy(&data[..check_len]);
-            let has_spine_version = head_str.contains("3.6") || head_str.contains("3.7") ||
-                                    head_str.contains("3.8") || head_str.contains("4.0") ||
-                                    head_str.contains("4.1") || head_str.contains("4.2");
-            if has_spine_version {
-                format!("{}.skel", safe_name)
+        let is_moc3 = data.starts_with(b"MOC3");
+        let name_lower = name.to_lowercase();
+        let filename = if is_moc3 {
+            let mut stem = name.clone();
+            if stem.to_lowercase().ends_with(".moc3") {
+                stem = stem[..stem.len() - 5].to_string();
+            } else if stem.to_lowercase().ends_with(".moc") {
+                stem = stem[..stem.len() - 4].to_string();
+            } else if stem.to_lowercase().ends_with("_moc3") {
+                stem = stem[..stem.len() - 5].to_string();
+            } else if stem.to_lowercase().ends_with("_moc") {
+                stem = stem[..stem.len() - 4].to_string();
+            }
+            format!("{}.moc3", stem)
+        } else if is_json_bytes(&data) {
+            let mut base = name.clone();
+            if base.to_lowercase().ends_with(".json") {
+                base = base[..base.len() - 5].to_string();
+            }
+            if name_lower.contains("physics") {
+                if base.to_lowercase().ends_with(".physics3") || base.to_lowercase().ends_with("_physics3") {
+                    let stem = base[..base.len() - 9].to_string();
+                    format!("{}.physics3.json", stem)
+                } else if base.to_lowercase().ends_with(".physics") || base.to_lowercase().ends_with("_physics") {
+                    let stem = base[..base.len() - 8].to_string();
+                    format!("{}.physics.json", stem)
+                } else {
+                    format!("{}.physics3.json", base)
+                }
+            } else if name_lower.contains("motion") {
+                if base.to_lowercase().ends_with(".motion3") || base.to_lowercase().ends_with("_motion3") {
+                    let stem = base[..base.len() - 8].to_string();
+                    format!("{}.motion3.json", stem)
+                } else if base.to_lowercase().ends_with(".motion") || base.to_lowercase().ends_with("_motion") {
+                    let stem = base[..base.len() - 7].to_string();
+                    format!("{}.motion.json", stem)
+                } else {
+                    format!("{}.motion3.json", base)
+                }
+            } else if name_lower.contains("pose") {
+                if base.to_lowercase().ends_with(".pose3") || base.to_lowercase().ends_with("_pose3") {
+                    let stem = base[..base.len() - 6].to_string();
+                    format!("{}.pose3.json", stem)
+                } else if base.to_lowercase().ends_with(".pose") || base.to_lowercase().ends_with("_pose") {
+                    let stem = base[..base.len() - 5].to_string();
+                    format!("{}.pose.json", stem)
+                } else {
+                    format!("{}.pose.json", base)
+                }
+            } else if name_lower.contains("cdi") {
+                if base.to_lowercase().ends_with(".cdi3") || base.to_lowercase().ends_with("_cdi3") {
+                    let stem = base[..base.len() - 5].to_string();
+                    format!("{}.cdi3.json", stem)
+                } else {
+                    format!("{}.cdi3.json", base)
+                }
+            } else if name_lower.contains("userdata") {
+                if base.to_lowercase().ends_with(".userdata3") || base.to_lowercase().ends_with("_userdata3") {
+                    let stem = base[..base.len() - 10].to_string();
+                    format!("{}.userdata3.json", stem)
+                } else {
+                    format!("{}.userdata3.json", base)
+                }
+            } else if name_lower.contains("exp") {
+                if base.to_lowercase().ends_with(".exp3") || base.to_lowercase().ends_with("_exp3") {
+                    let stem = base[..base.len() - 5].to_string();
+                    format!("{}.exp3.json", stem)
+                } else if base.to_lowercase().ends_with(".exp") || base.to_lowercase().ends_with("_exp") {
+                    let stem = base[..base.len() - 4].to_string();
+                    format!("{}.exp.json", stem)
+                } else {
+                    format!("{}.exp3.json", base)
+                }
             } else {
-                format!("{}.txt", safe_name)
+                format!("{}.json", base)
+            }
+        } else {
+            let safe_name = name.replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '.', "");
+            if safe_name.is_empty() {
+                "text_asset.txt".to_string()
+            } else if safe_name.contains('.') {
+                safe_name
+            } else {
+                let check_len = std::cmp::min(data.len(), 256);
+                let head_str = String::from_utf8_lossy(&data[..check_len]);
+                let has_spine_version = head_str.contains("3.6") || head_str.contains("3.7") ||
+                                        head_str.contains("3.8") || head_str.contains("4.0") ||
+                                        head_str.contains("4.1") || head_str.contains("4.2");
+                if has_spine_version {
+                    format!("{}.skel", safe_name)
+                } else {
+                    format!("{}.txt", safe_name)
+                }
             }
         };
         let text_dir = if by_file {
@@ -485,12 +1162,16 @@ fn extract_text_asset(val: &UnityValue, output_dir: &Path, by_file: bool, pb: &i
             output_dir.join("TextAsset")
         };
         let _ = std::fs::create_dir_all(&text_dir);
-        let dest = get_unique_path(&text_dir, &filename);
-        if let Err(e) = std::fs::write(&dest, &data) {
-            pb.println(format!("    Failed to write text asset '{}': {}", dest.display(), e));
-            false
-        } else {
-            true
+        match get_unique_path(&text_dir, &filename, Some(&data)) {
+            UniquePathResult::New(dest) => {
+                if let Err(e) = std::fs::write(&dest, &data) {
+                    pb.println(format!("    Failed to write text asset '{}': {}", dest.display(), e));
+                    false
+                } else {
+                    true
+                }
+            }
+            UniquePathResult::Exists(_) => true,
         }
     } else {
         false
@@ -578,7 +1259,9 @@ fn extract_texture2d(
             output_dir.join("Texture2D")
         };
         let _ = std::fs::create_dir_all(&texture_dir);
-        let dest = get_unique_path(&texture_dir, &filename);
+        let dest = match get_unique_path(&texture_dir, &filename, None) {
+            UniquePathResult::New(dest) | UniquePathResult::Exists(dest) => dest,
+        };
         if let Err(e) = image::save_buffer(
             &dest,
             &rgba_data,
@@ -657,12 +1340,16 @@ fn extract_mesh(val: &UnityValue, output_dir: &Path, by_file: bool, pb: &indicat
             output_dir.join("Mesh")
         };
         let _ = std::fs::create_dir_all(&mesh_dir);
-        let dest = get_unique_path(&mesh_dir, &filename);
-        if let Err(e) = std::fs::write(&dest, obj_content) {
-            pb.println(format!("    Failed to write Mesh OBJ '{}': {}", dest.display(), e));
-            false
-        } else {
-            true
+        match get_unique_path(&mesh_dir, &filename, Some(obj_content.as_bytes())) {
+            UniquePathResult::New(dest) => {
+                if let Err(e) = std::fs::write(&dest, obj_content) {
+                    pb.println(format!("    Failed to write Mesh OBJ '{}': {}", dest.display(), e));
+                    false
+                } else {
+                    true
+                }
+            }
+            UniquePathResult::Exists(_) => true,
         }
     } else {
         false
@@ -749,12 +1436,16 @@ fn extract_audioclip(
         output_dir.join("AudioClip")
     };
     let _ = std::fs::create_dir_all(&audio_dir);
-    let dest = get_unique_path(&audio_dir, &filename);
-    if let Err(e) = std::fs::write(&dest, &audio_data) {
-        pb.println(format!("    Failed to write AudioClip '{}': {}", dest.display(), e));
-        false
-    } else {
-        true
+    match get_unique_path(&audio_dir, &filename, Some(&audio_data)) {
+        UniquePathResult::New(dest) => {
+            if let Err(e) = std::fs::write(&dest, &audio_data) {
+                pb.println(format!("    Failed to write AudioClip '{}': {}", dest.display(), e));
+                false
+            } else {
+                true
+            }
+        }
+        UniquePathResult::Exists(_) => true,
     }
 }
 fn extract_videoclip(
@@ -804,12 +1495,16 @@ fn extract_videoclip(
                 output_dir.join("VideoClip")
             };
             let _ = std::fs::create_dir_all(&video_dir);
-            let dest = get_unique_path(&video_dir, &filename);
-            if let Err(e) = std::fs::write(&dest, &video_data) {
-                pb.println(format!("    Failed to write VideoClip '{}': {}", dest.display(), e));
-                false
-            } else {
-                true
+            match get_unique_path(&video_dir, &filename, Some(&video_data)) {
+                UniquePathResult::New(dest) => {
+                    if let Err(e) = std::fs::write(&dest, &video_data) {
+                        pb.println(format!("    Failed to write VideoClip '{}': {}", dest.display(), e));
+                        false
+                    } else {
+                        true
+                    }
+                }
+                UniquePathResult::Exists(_) => true,
             }
         } else {
             pb.println(format!("    Failed to extract VideoClip raw bytes: resource data is missing or empty."));
@@ -842,12 +1537,16 @@ fn extract_shader(val: &UnityValue, output_dir: &Path, by_file: bool, pb: &indic
             output_dir.join("Shader")
         };
         let _ = std::fs::create_dir_all(&shader_dir);
-        let dest = get_unique_path(&shader_dir, &filename);
-        if let Err(e) = std::fs::write(&dest, &data) {
-            pb.println(format!("    Failed to write Shader '{}': {}", dest.display(), e));
-            false
-        } else {
-            true
+        match get_unique_path(&shader_dir, &filename, Some(&data)) {
+            UniquePathResult::New(dest) => {
+                if let Err(e) = std::fs::write(&dest, &data) {
+                    pb.println(format!("    Failed to write Shader '{}': {}", dest.display(), e));
+                    false
+                } else {
+                    true
+                }
+            }
+            UniquePathResult::Exists(_) => true,
         }
     } else {
         false
@@ -886,9 +1585,11 @@ fn dump_asset_as_json(
         output_dir.join(sub_dir_name)
     };
     let _ = std::fs::create_dir_all(&target_dir);
-    let dest = get_unique_path(&target_dir, &filename);
     if let Ok(json_str) = serde_json::to_string_pretty(&json_val) {
-        std::fs::write(&dest, json_str).is_ok()
+        match get_unique_path(&target_dir, &filename, Some(json_str.as_bytes())) {
+            UniquePathResult::New(dest) => std::fs::write(&dest, json_str).is_ok(),
+            UniquePathResult::Exists(_) => true,
+        }
     } else {
         false
     }
@@ -1195,5 +1896,339 @@ fn decompress_texture(width: usize, height: usize, format: i32, image_data: &[u8
         Some(bytes)
     } else {
         None
+    }
+}
+fn compare_natural(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut a_chars = a.chars().peekable();
+    let mut b_chars = b.chars().peekable();
+    loop {
+        match (a_chars.peek(), b_chars.peek()) {
+            (Some(a_c), Some(b_c)) => {
+                if a_c.is_ascii_digit() && b_c.is_ascii_digit() {
+                    let mut a_num = 0u64;
+                    let mut a_len = 0;
+                    while let Some(&c) = a_chars.peek() {
+                        if let Some(digit) = c.to_digit(10) {
+                            a_num = a_num.wrapping_mul(10).wrapping_add(digit as u64);
+                            a_chars.next();
+                            a_len += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let mut b_num = 0u64;
+                    let mut b_len = 0;
+                    while let Some(&c) = b_chars.peek() {
+                        if let Some(digit) = c.to_digit(10) {
+                            b_num = b_num.wrapping_mul(10).wrapping_add(digit as u64);
+                            b_chars.next();
+                            b_len += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if a_num != b_num {
+                        return a_num.cmp(&b_num);
+                    }
+                    if a_len != b_len {
+                        return a_len.cmp(&b_len);
+                    }
+                } else {
+                    let ac = a_chars.next().unwrap();
+                    let bc = b_chars.next().unwrap();
+                    if ac != bc {
+                        return ac.cmp(&bc);
+                    }
+                }
+            }
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, _) => return std::cmp::Ordering::Less,
+            (_, None) => return std::cmp::Ordering::Greater,
+        }
+    }
+}
+fn get_model_base_name(filename: &str) -> String {
+    let mut stem = filename.to_lowercase();
+    for ext in &[".ab", ".asset", ".assets", ".assetbundle", ".bundle", ".bytes", ".prefab", ".unity3d", ".moc3", ".moc"] {
+        if stem.ends_with(ext) {
+            stem = stem[..stem.len() - ext.len()].to_string();
+        }
+    }
+    for marker in &["l2d_", "live2d_", "spine_", "chara_", "character_"] {
+        if let Some(idx) = stem.find(marker) {
+            let start_digits = idx + marker.len();
+            let mut end_digits = start_digits;
+            while end_digits < stem.len() && stem.as_bytes()[end_digits].is_ascii_digit() {
+                end_digits += 1;
+            }
+            if end_digits > start_digits {
+                stem = stem[..end_digits].to_string();
+                break;
+            }
+        }
+    }
+    let suffixes = &[
+        "texture", "textures", "tex",
+        "moc", "moc3",
+        "physics", "physics3",
+        "pose", "pose3",
+        "motion", "motion3",
+        "expression", "expressions", "exp", "exp3",
+        "userdata", "userdata3",
+        "cdi", "cdi3",
+        "postprocess", "postprocessing",
+        "material", "materials", "mat",
+        "controller", "controllers",
+        "animator", "animation", "animations",
+        "prefab", "prefabs",
+        "asset", "assets",
+        "bundle", "bundles",
+        "model", "model3"
+    ];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        if let Some(idx) = stem.rfind('_') {
+            let part = &stem[idx + 1 ..];
+            if part.len() >= 8 && part.chars().all(|c| c.is_ascii_hexdigit()) && !part.chars().all(|c| c.is_ascii_digit()) {
+                stem = stem[..idx].to_string();
+                changed = true;
+                continue;
+            }
+        }
+        if let Some(idx) = stem.rfind('_') {
+            let part = &stem[idx + 1 ..];
+            if !part.is_empty() && part.len() <= 3 && part.chars().all(|c| c.is_ascii_digit()) {
+                stem = stem[..idx].to_string();
+                changed = true;
+                continue;
+            }
+        }
+        for suffix in suffixes {
+            let suffix_with_underscore = format!("_{}", suffix);
+            if stem.ends_with(&suffix_with_underscore) {
+                stem = stem[..stem.len() - suffix_with_underscore.len()].to_string();
+                changed = true;
+                break;
+            }
+            if stem.ends_with(suffix) {
+                stem = stem[..stem.len() - suffix.len()].to_string();
+                changed = true;
+                break;
+            }
+        }
+        if stem.ends_with('_') || stem.ends_with('.') || stem.ends_with('-') {
+            stem.pop();
+            changed = true;
+        }
+    }
+    let sanitized = stem.replace(|c: char| !c.is_alphanumeric() && c != '_' && c != '-', "");
+    if sanitized.is_empty() {
+        "model".to_string()
+    } else {
+        sanitized
+    }
+}
+fn is_live2d_texture_name(name: &str) -> bool {
+    let name_lower = name.to_lowercase();
+    if !name_lower.ends_with(".png") {
+        return false;
+    }
+    let stem = &name_lower[..name_lower.len() - 4];
+    if !stem.starts_with("texture") {
+        return false;
+    }
+    let rest = if stem.starts_with("texture_") {
+        &stem["texture_".len()..]
+    } else {
+        &stem["texture".len()..]
+    };
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+}
+fn reconstruct_live2d_models(output_dir: &Path) {
+    let mut all_files = Vec::new();
+    fn collect_all_files(dir: &Path, files: &mut Vec<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_all_files(&path, files);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    collect_all_files(output_dir, &mut all_files);
+    let mut moc_files = Vec::new();
+    for path in &all_files {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            let ext_lower = ext.to_lowercase();
+            if ext_lower == "moc3" || ext_lower == "moc" {
+                moc_files.push(path.clone());
+            }
+        }
+    }
+    if moc_files.is_empty() {
+        return;
+    }
+    let mut processed_dirs = std::collections::HashSet::new();
+    for moc_path in moc_files {
+        let moc_filename = match moc_path.file_name().and_then(|f| f.to_str()) {
+            Some(f) => f.to_string(),
+            None => continue,
+        };
+        let base_key = get_model_base_name(&moc_filename);
+        if base_key.is_empty() {
+            continue;
+        }
+        let l2d_dir = output_dir.join(&base_key);
+        processed_dirs.insert(l2d_dir.clone());
+        if let Err(e) = std::fs::create_dir_all(&l2d_dir) {
+            eprintln!("Failed to create directory '{}': {}", l2d_dir.display(), e);
+            continue;
+        }
+        let dest_moc_path = l2d_dir.join(&moc_filename);
+        if moc_path != dest_moc_path {
+            if let Err(e) = std::fs::copy(&moc_path, &dest_moc_path) {
+                eprintln!("Failed to copy moc file '{}': {}", moc_filename, e);
+                continue;
+            }
+        }
+        for path in &all_files {
+            if path.starts_with(&l2d_dir) {
+                continue;
+            }
+            if path == &moc_path {
+                continue;
+            }
+            let rel_path = path.strip_prefix(output_dir).unwrap_or(path);
+            let rel_path_str = rel_path.to_string_lossy().to_lowercase();
+            if rel_path_str.contains(&base_key.to_lowercase()) {
+                let filename = match path.file_name() {
+                    Some(f) => f,
+                    None => continue,
+                };
+                let filename_str = filename.to_string_lossy();
+                let dest_path = if is_live2d_texture_name(&filename_str) {
+                    let tex_dir = l2d_dir.join("textures");
+                    let _ = std::fs::create_dir_all(&tex_dir);
+                    tex_dir.join(filename)
+                } else if filename_str.to_lowercase().ends_with(".motion3.json") || filename_str.to_lowercase().ends_with(".motion.json") {
+                    let mot_dir = l2d_dir.join("motions");
+                    let _ = std::fs::create_dir_all(&mot_dir);
+                    mot_dir.join(filename)
+                } else {
+                    l2d_dir.join(filename)
+                };
+                if let Err(e) = std::fs::copy(path, &dest_path) {
+                    eprintln!("Failed to copy asset from {:?} to {:?}: {}", path, dest_path, e);
+                }
+            }
+        }
+        let mut model_files = Vec::new();
+        collect_all_files(&l2d_dir, &mut model_files);
+        let mut textures = Vec::new();
+        let mut physics = None;
+        let mut display_info = None;
+        let mut userdata = None;
+        let mut pose = None;
+        let mut expressions = Vec::new();
+        let mut motions = std::collections::HashMap::new();
+        for file_path in &model_files {
+            let rel = file_path.strip_prefix(&l2d_dir).unwrap_or(file_path);
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let filename = match file_path.file_name().and_then(|f| f.to_str()) {
+                Some(f) => f,
+                None => continue,
+            };
+            if is_live2d_texture_name(filename) {
+                textures.push(rel_str);
+            } else {
+                let filename_lower = filename.to_lowercase();
+                if filename_lower.ends_with(".physics3.json") || filename_lower.ends_with(".physics.json") {
+                    physics = Some(rel_str);
+                } else if filename_lower.ends_with(".cdi3.json") || filename_lower.ends_with(".cdi.json") {
+                    display_info = Some(rel_str);
+                } else if filename_lower.ends_with(".userdata3.json") || filename_lower.ends_with(".userdata.json") {
+                    userdata = Some(rel_str);
+                } else if filename_lower.ends_with(".pose3.json") || filename_lower.ends_with(".pose.json") {
+                    pose = Some(rel_str);
+                } else if filename_lower.ends_with(".exp3.json") || filename_lower.ends_with(".exp.json") {
+                    expressions.push(serde_json::json!({
+                        "Name": filename.replace(".exp3.json", "").replace(".exp.json", ""),
+                        "File": rel_str
+                    }));
+                } else if filename_lower.ends_with(".motion3.json") || filename_lower.ends_with(".motion.json") {
+                    let group = motions.entry("".to_string()).or_insert_with(Vec::new);
+                    group.push(serde_json::json!({
+                        "File": rel_str
+                    }));
+                }
+            }
+        }
+        textures.sort_unstable_by(|a, b| compare_natural(a, b));
+        let moc_stem = moc_filename.strip_suffix(".moc3").or_else(|| moc_filename.strip_suffix(".moc")).unwrap_or(&moc_filename);
+        let mut file_references = serde_json::json!({
+            "Moc": moc_filename,
+            "Textures": textures
+        });
+        if let Some(ref p) = physics {
+            file_references["Physics"] = serde_json::Value::String(p.clone());
+        }
+        if let Some(ref d) = display_info {
+            file_references["DisplayInfo"] = serde_json::Value::String(d.clone());
+        }
+        if let Some(ref u) = userdata {
+            file_references["UserData"] = serde_json::Value::String(u.clone());
+        }
+        if let Some(ref p_pose) = pose {
+            file_references["Pose"] = serde_json::Value::String(p_pose.clone());
+        }
+        if !expressions.is_empty() {
+            file_references["Expressions"] = serde_json::Value::Array(expressions);
+        }
+        if !motions.is_empty() {
+            file_references["Motions"] = serde_json::to_value(motions).unwrap_or(serde_json::Value::Null);
+        }
+        let model3_json = serde_json::json!({
+            "Version": 3,
+            "FileReferences": file_references
+        });
+        let model3_json_path = l2d_dir.join(format!("{}.model3.json", moc_stem));
+        if let Ok(file) = std::fs::File::create(&model3_json_path) {
+            let _ = serde_json::to_writer_pretty(file, &model3_json);
+        }
+    }
+    let mut dirs_to_delete = std::collections::HashSet::new();
+    for path in &all_files {
+        if let Some(parent) = path.parent() {
+            if parent == output_dir {
+                continue;
+            }
+            let mut inside_processed = false;
+            for dest_dir in &processed_dirs {
+                if parent.starts_with(dest_dir) {
+                    inside_processed = true;
+                    break;
+                }
+            }
+            if inside_processed {
+                continue;
+            }
+            let rel = parent.strip_prefix(output_dir).unwrap_or(parent);
+            let rel_str = rel.to_string_lossy().to_lowercase();
+            for dest_dir in &processed_dirs {
+                let base_key = dest_dir.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                if rel_str.contains(&base_key) {
+                    dirs_to_delete.insert(parent.to_path_buf());
+                }
+            }
+        }
+    }
+    for dir in dirs_to_delete {
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
