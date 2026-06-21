@@ -11,8 +11,10 @@ A CLI tool to extract assets and dump metadata from Unity asset bundles.
   - `TextAsset` -> `.txt`
   - `Texture2D` -> `.png`
   - `VideoClip` -> `.mp4` / etc.
-- **Metadata Extraction (`--metadata`)**:
+- **Metadata Extraction (`--metadata` / `-m`)**:
   - Dumps structural JSON data for `GameObject`, `Transform`, `Material`, `MonoBehaviour`, and `AnimationClip` types.
+- **Live2D Reconstruction (`--live2d` / `-l`)**:
+  - Reconstructs and merges Live2D model assets (`.moc3`, textures, physics, expressions, motions) into dedicated model folders.
 
 ## Usage
 
@@ -25,10 +27,11 @@ unityfs-cli <PATH_TO_BUNDLE>
 ### Command-line Options
 
 - `-o`, `--output <DIR>`: Specifies the output root directory (Default: `./out`).
-- `-m`, `--metadata`: Enables JSON metadata dump for GameObjects, Transforms, Materials, MonoBehaviours, and AnimationClips.
 - `-n`, `--name <NAME>`: Filters assets to extract by name (case-insensitive substring match).
 - `-t`, `--type <TYPE>`: Filters assets to extract by type (case-insensitive substring match, e.g., `texture2d`, `audioclip`).
 - `-b`, `--by-file`: Extracts assets directly into subdirectories named after each bundle file, without creating separate asset class subfolders (e.g., `out/bundle_name/file.png` instead of `out/Texture2D/file.png`).
+- `-m`, `--metadata`: Enables JSON metadata dump for GameObjects, Transforms, Materials, MonoBehaviours, and AnimationClips.
+- `-l`, `--live2d`: Reconstructs and merges Live2D models from extracted assets.
 
 ### Examples
 
@@ -36,8 +39,8 @@ unityfs-cli <PATH_TO_BUNDLE>
 # Extract only Texture2D files containing "character" in their name:
 unityfs-cli -t texture2d -n character path/to/bundle.ab
 
-# Extract all media and dump structural JSON metadata:
-unityfs-cli --metadata path/to/bundle.ab
+# Extract assets into subdirectories named after the bundle file (without type subfolders):
+unityfs-cli -b path/to/bundle.ab
 ```
 
 ### Interactive Mode
