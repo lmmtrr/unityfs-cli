@@ -28,6 +28,7 @@ unityfs-cli <PATH_TO_BUNDLE>
 - `-m`, `--metadata`: Enables JSON metadata dump for GameObjects, Transforms, Materials, MonoBehaviours, and AnimationClips.
 - `-n`, `--name <NAME>`: Filters assets to extract by name (case-insensitive substring match).
 - `-t`, `--type <TYPE>`: Filters assets to extract by type (case-insensitive substring match, e.g., `texture2d`, `audioclip`).
+- `-b`, `--by-file`: Extracts assets directly into subdirectories named after each bundle file, without creating separate asset class subfolders (e.g., `out/bundle_name/file.png` instead of `out/Texture2D/file.png`).
 
 ### Examples
 

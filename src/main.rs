@@ -18,16 +18,19 @@ struct Args {
     output: String,
     #[arg(short, long)]
     metadata: bool,
-    #[arg(long = "name", short = 'n')]
+    #[arg(long = "name", short = "n")]
     filter_name: Option<String>,
-    #[arg(long = "type", short = 't')]
+    #[arg(long = "type", short = "t")]
     filter_type: Option<String>,
+    #[arg(long = "by-file", short = "b", help = "Extract into subdirectories named after each bundle file, without asset class subfolders")]
+    by_file: bool,
 }
 #[derive(Clone, Debug)]
 struct ExtractFilter {
     extract_metadata: bool,
     filter_name: Option<String>,
     filter_type: Option<String>,
+    by_file: bool,
 }
 fn extract_bundle_files_in_parallel(files: &[PathBuf], base_output_dir: &Path, filter: &ExtractFilter) {
     let pb = indicatif::ProgressBar::new(files.len() as u64);
@@ -75,6 +78,7 @@ fn main() {
         extract_metadata: args.metadata,
         filter_name: args.filter_name,
         filter_type: args.filter_type,
+        by_file: args.by_file,
     };
     if input_paths.is_empty() {
         run_interactive_mode(&output_dir, &filter);
@@ -193,6 +197,7 @@ fn find_and_extract_criware_bytes(
     output_dir: &Path,
     base_name: &str,
     parent_key: &str,
+    by_file: bool,
     pb: &indicatif::ProgressBar,
 ) -> bool {
     match value {
@@ -219,7 +224,11 @@ fn find_and_extract_criware_bytes(
                     } else {
                         format!("{}_{}.{}", base_name, parent_key, extension)
                     };
-                    let cri_dir = output_dir.join("CriWare");
+                    let cri_dir = if by_file {
+                        output_dir.to_path_buf()
+                    } else {
+                        output_dir.join("CriWare")
+                    };
                     let _ = std::fs::create_dir_all(&cri_dir);
                     let dest = get_unique_path(&cri_dir, &filename);
                     if let Err(e) = std::fs::write(&dest, bytes) {
@@ -254,7 +263,7 @@ fn find_and_extract_criware_bytes(
                     }
                 }
                 if is_byte_array {
-                    return find_and_extract_criware_bytes(&UnityValue::Bytes(bytes), output_dir, base_name, parent_key, pb);
+                    return find_and_extract_criware_bytes(&UnityValue::Bytes(bytes), output_dir, base_name, parent_key, by_file, pb);
                 }
             }
             let mut extracted = false;
@@ -264,7 +273,7 @@ fn find_and_extract_criware_bytes(
                 } else {
                     format!("{}_{}", parent_key, idx)
                 };
-                if find_and_extract_criware_bytes(item, output_dir, base_name, &item_key, pb) {
+                if find_and_extract_criware_bytes(item, output_dir, base_name, &item_key, by_file, pb) {
                     extracted = true;
                 }
             }
@@ -278,7 +287,7 @@ fn find_and_extract_criware_bytes(
                 } else {
                     format!("{}_{}", parent_key, k)
                 };
-                if find_and_extract_criware_bytes(v, output_dir, base_name, &item_key, pb) {
+                if find_and_extract_criware_bytes(v, output_dir, base_name, &item_key, by_file, pb) {
                     extracted = true;
                 }
             }
@@ -315,7 +324,11 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
             return;
         }
     };
-    let bundle_output_dir = base_output_dir.to_path_buf();
+    let bundle_output_dir = if filter.by_file {
+        base_output_dir.join(file_stem.as_ref())
+    } else {
+        base_output_dir.to_path_buf()
+    };
     if let Err(e) = std::fs::create_dir_all(&bundle_output_dir) {
         pb.println(format!("[{}] Failed to create output directory '{}': {}", file_stem, bundle_output_dir.display(), e));
         return;
@@ -392,22 +405,22 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
                 pb.set_message(format!("{}: {}", t_name, m_name));
                 let success = match class_id {
                     28 => {
-                        extract_texture2d(&unity_value, &bundle_output_dir, &asset_manager, pb)
+                        extract_texture2d(&unity_value, &bundle_output_dir, &asset_manager, filter.by_file, pb)
                     }
                     49 => {
-                        extract_text_asset(&unity_value, &bundle_output_dir, pb)
+                        extract_text_asset(&unity_value, &bundle_output_dir, filter.by_file, pb)
                     }
                     43 => {
-                        extract_mesh(&unity_value, &bundle_output_dir, pb)
+                        extract_mesh(&unity_value, &bundle_output_dir, filter.by_file, pb)
                     }
                     83 => {
-                        extract_audioclip(&unity_value, &bundle_output_dir, &asset_manager, pb)
+                        extract_audioclip(&unity_value, &bundle_output_dir, &asset_manager, filter.by_file, pb)
                     }
                     48 => {
-                        extract_shader(&unity_value, &bundle_output_dir, pb)
+                        extract_shader(&unity_value, &bundle_output_dir, filter.by_file, pb)
                     }
                     329 => {
-                        extract_videoclip(&unity_value, &bundle_output_dir, &asset_manager, pb)
+                        extract_videoclip(&unity_value, &bundle_output_dir, &asset_manager, filter.by_file, pb)
                     }
                     114 => {
                         let base_name = if !m_name.is_empty() {
@@ -415,15 +428,15 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
                         } else {
                             format!("monobehaviour_{}", path_id)
                         };
-                        let ext_success = find_and_extract_criware_bytes(&unity_value, &bundle_output_dir, &base_name, "", pb);
+                        let ext_success = find_and_extract_criware_bytes(&unity_value, &bundle_output_dir, &base_name, "", filter.by_file, pb);
                         if filter.extract_metadata {
-                            dump_asset_as_json(class_id, t_name, &unity_value, &bundle_output_dir, path_id);
+                            dump_asset_as_json(class_id, t_name, &unity_value, &bundle_output_dir, filter.by_file, path_id);
                         }
                         ext_success
                     }
                     1 | 4 | 21 | 74 | 115 => {
                         if filter.extract_metadata {
-                            dump_asset_as_json(class_id, t_name, &unity_value, &bundle_output_dir, path_id)
+                            dump_asset_as_json(class_id, t_name, &unity_value, &bundle_output_dir, filter.by_file, path_id)
                         } else {
                             false
                         }
@@ -438,7 +451,7 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
         })
         .collect();
 }
-fn extract_text_asset(val: &UnityValue, output_dir: &Path, pb: &indicatif::ProgressBar) -> bool {
+fn extract_text_asset(val: &UnityValue, output_dir: &Path, by_file: bool, pb: &indicatif::ProgressBar) -> bool {
     let name = match val.get("m_Name") {
         Some(UnityValue::String(s)) if !s.is_empty() => s.clone(),
         _ => "text_asset".to_string(),
@@ -466,7 +479,11 @@ fn extract_text_asset(val: &UnityValue, output_dir: &Path, pb: &indicatif::Progr
                 format!("{}.txt", safe_name)
             }
         };
-        let text_dir = output_dir.join("TextAsset");
+        let text_dir = if by_file {
+            output_dir.to_path_buf()
+        } else {
+            output_dir.join("TextAsset")
+        };
         let _ = std::fs::create_dir_all(&text_dir);
         let dest = get_unique_path(&text_dir, &filename);
         if let Err(e) = std::fs::write(&dest, &data) {
@@ -483,6 +500,7 @@ fn extract_texture2d(
     val: &UnityValue,
     output_dir: &Path,
     asset_manager: &AssetManager,
+    by_file: bool,
     pb: &indicatif::ProgressBar,
 ) -> bool {
     let name = match val.get("m_Name") {
@@ -554,7 +572,11 @@ fn extract_texture2d(
         } else {
             format!("{}.png", safe_name)
         };
-        let texture_dir = output_dir.join("Texture2D");
+        let texture_dir = if by_file {
+            output_dir.to_path_buf()
+        } else {
+            output_dir.join("Texture2D")
+        };
         let _ = std::fs::create_dir_all(&texture_dir);
         let dest = get_unique_path(&texture_dir, &filename);
         if let Err(e) = image::save_buffer(
@@ -574,7 +596,7 @@ fn extract_texture2d(
         false
     }
 }
-fn extract_mesh(val: &UnityValue, output_dir: &Path, pb: &indicatif::ProgressBar) -> bool {
+fn extract_mesh(val: &UnityValue, output_dir: &Path, by_file: bool, pb: &indicatif::ProgressBar) -> bool {
     let name = match val.get("m_Name") {
         Some(UnityValue::String(s)) if !s.is_empty() => s.clone(),
         _ => "mesh".to_string(),
@@ -629,7 +651,11 @@ fn extract_mesh(val: &UnityValue, output_dir: &Path, pb: &indicatif::ProgressBar
         } else {
             format!("{}.obj", safe_name)
         };
-        let mesh_dir = output_dir.join("Mesh");
+        let mesh_dir = if by_file {
+            output_dir.to_path_buf()
+        } else {
+            output_dir.join("Mesh")
+        };
         let _ = std::fs::create_dir_all(&mesh_dir);
         let dest = get_unique_path(&mesh_dir, &filename);
         if let Err(e) = std::fs::write(&dest, obj_content) {
@@ -646,6 +672,7 @@ fn extract_audioclip(
     val: &UnityValue,
     output_dir: &Path,
     asset_manager: &AssetManager,
+    by_file: bool,
     pb: &indicatif::ProgressBar,
 ) -> bool {
     let name = match val.get("m_Name") {
@@ -716,7 +743,11 @@ fn extract_audioclip(
     } else {
         format!("{}.{}", safe_name, extension)
     };
-    let audio_dir = output_dir.join("AudioClip");
+    let audio_dir = if by_file {
+        output_dir.to_path_buf()
+    } else {
+        output_dir.join("AudioClip")
+    };
     let _ = std::fs::create_dir_all(&audio_dir);
     let dest = get_unique_path(&audio_dir, &filename);
     if let Err(e) = std::fs::write(&dest, &audio_data) {
@@ -730,6 +761,7 @@ fn extract_videoclip(
     val: &UnityValue,
     output_dir: &Path,
     asset_manager: &AssetManager,
+    by_file: bool,
     pb: &indicatif::ProgressBar,
 ) -> bool {
     let video_clip = match unityfs::classes::videoclip::VideoClip::from_value(val.clone()) {
@@ -766,7 +798,11 @@ fn extract_videoclip(
             } else {
                 format!("{}{}", sanitized_base, dot_ext)
             };
-            let video_dir = output_dir.join("VideoClip");
+            let video_dir = if by_file {
+                output_dir.to_path_buf()
+            } else {
+                output_dir.join("VideoClip")
+            };
             let _ = std::fs::create_dir_all(&video_dir);
             let dest = get_unique_path(&video_dir, &filename);
             if let Err(e) = std::fs::write(&dest, &video_data) {
@@ -783,7 +819,7 @@ fn extract_videoclip(
         false
     }
 }
-fn extract_shader(val: &UnityValue, output_dir: &Path, pb: &indicatif::ProgressBar) -> bool {
+fn extract_shader(val: &UnityValue, output_dir: &Path, by_file: bool, pb: &indicatif::ProgressBar) -> bool {
     let name = match val.get("m_Name") {
         Some(UnityValue::String(s)) if !s.is_empty() => s.clone(),
         _ => "shader".to_string(),
@@ -800,7 +836,11 @@ fn extract_shader(val: &UnityValue, output_dir: &Path, pb: &indicatif::ProgressB
         } else {
             format!("{}.shader", safe_name)
         };
-        let shader_dir = output_dir.join("Shader");
+        let shader_dir = if by_file {
+            output_dir.to_path_buf()
+        } else {
+            output_dir.join("Shader")
+        };
         let _ = std::fs::create_dir_all(&shader_dir);
         let dest = get_unique_path(&shader_dir, &filename);
         if let Err(e) = std::fs::write(&dest, &data) {
@@ -818,6 +858,7 @@ fn dump_asset_as_json(
     type_name: &str,
     val: &UnityValue,
     output_dir: &Path,
+    by_file: bool,
     path_id: i64,
 ) -> bool {
     let name = match val.get("m_Name") {
@@ -839,7 +880,11 @@ fn dump_asset_as_json(
         4 => "transforms",
         _ => "meta",
     };
-    let target_dir = output_dir.join(sub_dir_name);
+    let target_dir = if by_file {
+        output_dir.to_path_buf()
+    } else {
+        output_dir.join(sub_dir_name)
+    };
     let _ = std::fs::create_dir_all(&target_dir);
     let dest = get_unique_path(&target_dir, &filename);
     if let Ok(json_str) = serde_json::to_string_pretty(&json_val) {
