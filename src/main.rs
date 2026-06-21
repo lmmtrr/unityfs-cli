@@ -30,7 +30,7 @@ struct ExtractFilter {
     filter_type: Option<String>,
 }
 fn extract_bundle_files_in_parallel(files: &[PathBuf], base_output_dir: &Path, filter: &ExtractFilter) {
-    let pb = indicatif::ProgressBar::new(0);
+    let pb = indicatif::ProgressBar::new(files.len() as u64);
     pb.set_style(
         indicatif::ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}")
@@ -41,6 +41,7 @@ fn extract_bundle_files_in_parallel(files: &[PathBuf], base_output_dir: &Path, f
     pb.tick();
     files.par_iter().for_each(|file_path| {
         extract_bundle_file(file_path, base_output_dir, filter, &pb);
+        pb.inc(1);
     });
     pb.finish();
 }
@@ -376,7 +377,6 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
     if objects_to_extract.is_empty() {
         return;
     }
-    pb.inc_length(objects_to_extract.len() as u64);
     let _: Vec<String> = objects_to_extract
         .par_iter()
         .filter_map(|(asset_name, obj)| {
@@ -434,7 +434,6 @@ fn extract_bundle_file(file_path: &Path, base_output_dir: &Path, filter: &Extrac
                     res = Some(t_name.to_string());
                 }
             }
-            pb.inc(1);
             res
         })
         .collect();
